@@ -42,6 +42,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     this.addCommand({ id: "check-github", name: "Проверить подключение к GitHub", callback: () => this.checkGitHub() });
     this.addCommand({ id: "sync-now", name: "Синхронизировать сейчас", callback: () => this.backgroundSync(true) });
     this.addCommand({ id: "verify-all-files", name: "Проверить все файлы GitHub и скачать недостающие", callback: () => this.verifyAllFiles() });
+    this.addCommand({ id: "download-only", name: "Первичная загрузка с GitHub (только скачивание)", callback: () => this.downloadOnly() });
     this.addCommand({ id: "push-current-note", name: "Отправить открытую заметку и фотографии", callback: () => this.pushCurrentNote() });
     this.addCommand({ id: "pull-current-note", name: "Получить открытую заметку из GitHub", callback: () => this.pullCurrentNote() });
     this.addCommand({ id: "update-plugin", name: "Проверить обновление плагина", callback: () => this.checkForPluginUpdate(true) });
@@ -825,6 +826,45 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
       new Notice("Не удалось полностью загрузить хранилище. Плагин повторит попытку после перезапуска", 10000);
     } finally {
       this.uploadRunning = false;
+    }
+  }
+
+  async downloadOnly() {
+    if (!this.requireSettings() || this.syncRunning) return;
+    this.syncRunning = true;
+    let count = 0;
+    let errors = 0;
+    try {
+      const head = await this.getRemoteHead();
+      if (!head) throw new Error("GitHub branch unavailable");
+      const response = await requestUrl({
+        url: this.apiUrl(`/git/trees/${encodeURIComponent(head)}?recursive=1`),
+        method: "GET", headers: this.headers(), throw: false,
+      });
+      if (response.status !== 200 || !Array.isArray(response.json.tree) || response.json.truncated) throw new Error("Incomplete GitHub tree");
+      for (const item of response.json.tree) {
+        if (item.type !== "blob" || this.shouldIgnorePath(item.path)) continue;
+        const local = this.app.vault.getAbstractFileByPath(item.path);
+        if (local) continue;
+        try {
+          await this.pullRemoteFile(item.path, item.sha, false);
+          count++;
+        } catch (error) {
+          errors++;
+          console.error("Download-only failed:", item.path, error);
+        }
+      }
+      if (!errors) {
+        this.settings.lastRemoteHead = head;
+        this.settings.initialUploadComplete = true;
+        await this.saveSettings();
+      }
+      new Notice(`Скачано: ${count}, ошибок: ${errors}. Отправки в GitHub не было.`, 12000);
+    } catch (error) {
+      console.error("Download-only:", error);
+      new Notice("Не удалось скачать заметки с GitHub", 10000);
+    } finally {
+      this.syncRunning = false;
     }
   }
 
