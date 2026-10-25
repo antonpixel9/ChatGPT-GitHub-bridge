@@ -60,7 +60,8 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       window.setTimeout(async () => {
         await this.backgroundSync(false);
-        if (!this.settings.initialUploadComplete) await this.uploadWholeVault();
+        // First-time vaults must never upload automatically.
+        // Use the explicit download command before enabling sync.
         this.startupReady = true;
       }, 2500);
     });
