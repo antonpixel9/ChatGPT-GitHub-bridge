@@ -963,6 +963,10 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
 
   async backgroundSync(showNotice) {
     if (!this.settings.autoSync && !showNotice) return;
+    if (!this.settings.initialUploadComplete) {
+      if (showNotice) new Notice("Сначала выполните команду «Первичная загрузка с GitHub»");
+      return;
+    }
     if (!this.requireSettings(showNotice) || this.syncRunning || this.localOperationsPending || this.pendingPushes.size) return;
 
     this.syncRunning = true;
