@@ -51,7 +51,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     this.addRibbonIcon("refresh-cw", "Синхронизировать сейчас", () => this.backgroundSync(true));
 
     this.registerEvent(this.app.vault.on("modify", (file) => this.onLocalChange(file)));
-    this.registerEvent(this.app.vault.on("create", (file) => this.onLocalChange(file)));
+    this.registerEvent(this.app.vault.on("create", (file) => { if (file instanceof TFolder && this.startupReady && this.settings.autoSync && !this.applyingRemote) this.queueLocalOperation("folder create", () => this.publishEmptyFolders()); else this.onLocalChange(file); }));
     this.registerEvent(this.app.vault.on("delete", (file) => this.onLocalDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onLocalRename(file, oldPath)));
 
@@ -247,6 +247,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
   onLocalDelete(file) {
     if (!this.startupReady || !this.settings.autoSync || this.applyingRemote || !(file instanceof TFile || file instanceof TFolder)) return;
 
+    if (file instanceof TFolder) { this.queueLocalOperation("folder delete", async () => { await this.removeFolderMarker(file.path); delete (this.settings.folderMarkers || {})[file.path]; await this.saveSettings(); }); }
     const paths = (file instanceof TFile
       ? [file.path]
       : Object.keys(this.settings.remoteShas).filter((path) => path.startsWith(`${file.path}/`)))
@@ -262,6 +263,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
   onLocalRename(file, oldPath) {
     if (!this.startupReady || !this.settings.autoSync || this.applyingRemote || !(file instanceof TFile || file instanceof TFolder) || file.path === oldPath) return;
 
+    if (file instanceof TFolder) this.queueLocalOperation("folder rename", async () => { await this.removeFolderMarker(oldPath); delete (this.settings.folderMarkers || {})[oldPath]; await this.publishEmptyFolders(); });
     const moves = [];
     if (file instanceof TFile) {
       moves.push({ oldPath, file });
@@ -495,6 +497,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     if (response.status !== 200 || !Array.isArray(response.json.tree)) throw new Error(`Tree: ${response.status}`);
 
     if (response.json.truncated) throw new Error("GitHub вернул неполный список файлов");
+    await this.applyFolderMarkers(response.json.tree);
     let received = 0;
     const failures = [];
     const items = response.json.tree.slice().sort((a, b) => {
@@ -558,7 +561,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
         .map((item) => item.path)
     );
     received += await this.deleteRemoteMissingFiles(remotePaths);
-    if (this.settings.initialUploadComplete) received += await this.uploadLocalMissingFiles(remotePaths);
+    if (this.settings.initialUploadComplete) { received += await this.uploadLocalMissingFiles(remotePaths); await this.publishEmptyFolders(); }
 
     if (!failures.length) this.settings.lastRemoteHead = head;
     await this.saveSettings();
@@ -842,6 +845,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
         method: "GET", headers: this.headers(), throw: false,
       });
       if (response.status !== 200 || !Array.isArray(response.json.tree) || response.json.truncated) throw new Error("Incomplete GitHub tree");
+      await this.applyFolderMarkers(response.json.tree);
       for (const item of response.json.tree) {
         if (item.type !== "blob" || this.shouldIgnorePath(item.path)) continue;
         const local = this.app.vault.getAbstractFileByPath(item.path);
@@ -866,6 +870,80 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     } finally {
       this.syncRunning = false;
     }
+  }
+
+  folderMarker(path) { return `${path}/.gitkeep`; }
+
+  async putFolderMarker(path) {
+    if (!this.requireSettings(false) || !path || this.shouldIgnorePath(path)) return;
+    const marker = this.folderMarker(path);
+    const current = await this.getRemoteFile(marker);
+    if (current.status === 200) return;
+    if (current.status !== 404) throw new Error(`Folder marker: ${current.status}`);
+    const response = await requestUrl({
+      url: this.apiUrl(`/contents/${this.encodedPath(marker)}`),
+      method: "PUT", headers: this.headers(),
+      body: JSON.stringify({ message: `Obsidian: создать папку ${path}`, content: "Cg==", branch: this.settings.branch }),
+      throw: false,
+    });
+    if (response.status !== 201 && response.status !== 200) throw new Error(`Folder marker upload: ${response.status}`);
+  }
+
+  async removeFolderMarker(path) {
+    if (!path) return;
+    const marker = this.folderMarker(path);
+    const current = await this.getRemoteFile(marker);
+    if (current.status === 404) return;
+    if (current.status !== 200 || !current.json.sha) throw new Error(`Folder marker read: ${current.status}`);
+    const response = await requestUrl({
+      url: this.apiUrl(`/contents/${this.encodedPath(marker)}`),
+      method: "DELETE", headers: this.headers(),
+      body: JSON.stringify({ message: `Obsidian: удалить маркер папки ${path}`, sha: current.json.sha, branch: this.settings.branch }),
+      throw: false,
+    });
+    if (response.status !== 200) throw new Error(`Folder marker delete: ${response.status}`);
+  }
+
+  async applyFolderMarkers(tree) {
+    const markers = tree.filter(item => item.type === "blob" && item.path.endsWith("/.gitkeep"));
+    const remote = new Set(markers.map(item => item.path.slice(0, -"/.gitkeep".length)));
+    const known = this.settings.folderMarkers || {};
+    for (const folder of remote) {
+      if (!this.app.vault.getAbstractFileByPath(folder)) {
+        this.applyingRemote = true;
+        try { await this.ensureFolder(folder + "/.gitkeep"); }
+        finally { this.applyingRemote = false; }
+      }
+      known[folder] = true;
+    }
+    for (const folder of Object.keys(known)) {
+      if (remote.has(folder)) continue;
+      const local = this.app.vault.getAbstractFileByPath(folder);
+      if (local instanceof TFolder && !local.children.length) {
+        this.applyingRemote = true;
+        try { await this.app.vault.delete(local, true); }
+        finally { this.applyingRemote = false; }
+      }
+      delete known[folder];
+    }
+    this.settings.folderMarkers = known;
+  }
+
+  async publishEmptyFolders() {
+    const folders = [];
+    const walk = folder => {
+      if (!(folder instanceof TFolder)) return;
+      if (folder.path && !this.shouldIgnorePath(folder.path) && folder.children.length === 0) folders.push(folder.path);
+      for (const child of folder.children) if (child instanceof TFolder) walk(child);
+    };
+    walk(this.app.vault.getRoot());
+    for (const folder of folders) {
+      if (this.settings.folderMarkers && this.settings.folderMarkers[folder]) continue;
+      await this.putFolderMarker(folder);
+      this.settings.folderMarkers = this.settings.folderMarkers || {};
+      this.settings.folderMarkers[folder] = true;
+    }
+    await this.saveSettings();
   }
 
   async verifyAllFiles() {
