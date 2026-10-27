@@ -1,7 +1,7 @@
 {
   "id": "chatgpt-github-bridge",
   "name": "ChatGPT GitHub Bridge",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "minAppVersion": "1.5.0",
   "description": "Автоматическая связь Obsidian с GitHub и ChatGPT для заметок и вложений.",
   "author": "Anton Chursin",
