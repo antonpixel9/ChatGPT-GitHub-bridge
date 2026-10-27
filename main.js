@@ -1028,12 +1028,19 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
   }
 
   async backgroundSync(showNotice) {
+    if (!this.requireSettings(showNotice)) return;
+
+    // Plugin updates are independent from note synchronization. This must run
+    // even when automatic sync is disabled or the first safe download has not
+    // completed yet.
+    if (this.settings.autoUpdate) await this.checkForPluginUpdate(false);
+
     if (!this.settings.autoSync && !showNotice) return;
     if (!this.settings.initialUploadComplete) {
       if (showNotice) new Notice("Сначала выполните команду «Первичная загрузка с GitHub»");
       return;
     }
-    if (!this.requireSettings(showNotice) || this.syncRunning || this.localOperationsPending || this.pendingPushes.size) return;
+    if (this.syncRunning || this.localOperationsPending || this.pendingPushes.size) return;
 
     this.syncRunning = true;
     try {
@@ -1045,7 +1052,6 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
         await this.checkForCompanionPlugin(false, head);
       }
 
-      await this.checkForPluginUpdate(false);
       const headChanged = head !== this.settings.lastRemoteHead;
       const fullScanDue = Date.now() - this.lastFullScanAt >= 5 * 60 * 1000;
       if (headChanged || fullScanDue || showNotice) {
