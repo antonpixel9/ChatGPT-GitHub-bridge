@@ -145,6 +145,48 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 
+  textForMerge(path, bytes) {
+    if (!/\.(md|txt|json|canvas|css|csv|tsv)$/i.test(path)) return null;
+    try {
+      return new TextDecoder("utf-8", { fatal: true })
+        .decode(bytes)
+        .replace(/\r\n/g, "\n")
+        .normalize("NFC");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async resolveLinearTextConflict(path, localBytes, remoteBytes, knownSha) {
+    if (!knownSha) return null;
+
+    const localText = this.textForMerge(path, localBytes);
+    const remoteText = this.textForMerge(path, remoteBytes);
+    if (localText === null || remoteText === null) return null;
+    if (localText === remoteText) return "remote";
+
+    try {
+      const baseBytes = knownSha === "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        ? new Uint8Array(0)
+        : await this.fetchBlob(knownSha);
+      const baseText = this.textForMerge(path, baseBytes);
+      if (baseText === null) return null;
+
+      // Obsidian saves a note repeatedly while the user is typing. If both
+      // versions still contain the common base and one is entirely contained
+      // in the other, this is one growing edit rather than two independent
+      // edits. Keep the complete version without creating a duplicate.
+      if (localText.includes(baseText) && remoteText.includes(baseText)) {
+        if (localText.length > remoteText.length && localText.includes(remoteText)) return "local";
+        if (remoteText.length > localText.length && remoteText.includes(localText)) return "remote";
+      }
+    } catch (error) {
+      console.warn("ChatGPT GitHub Bridge conflict base:", path, error);
+    }
+
+    return null;
+  }
+
   async getRemoteFile(path, ref = this.settings.branch) {
     return requestUrl({
       url: this.apiUrl(`/contents/${this.encodedPath(path)}?ref=${encodeURIComponent(ref)}`),
@@ -353,9 +395,22 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
 
     const knownSha = this.settings.remoteShas[file.path];
     if (current.status === 200 && knownSha && current.json.sha !== knownSha) {
-      new Notice(`Есть изменения ChatGPT: ${file.name}. Они будут получены автоматически`);
-      await this.pullRemoteFile(file.path, current.json.sha, true);
-      return;
+      const remoteBytes = current.json.sha === "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        ? new Uint8Array(0)
+        : await this.fetchBlob(current.json.sha);
+      const resolution = await this.resolveLinearTextConflict(file.path, bytes, remoteBytes, knownSha);
+
+      if (resolution === "remote") {
+        await this.pullRemoteFile(file.path, current.json.sha, false);
+        return;
+      }
+      if (resolution !== "local") {
+        new Notice(`Есть независимые изменения: ${file.name}. Сохранена защитная копия`);
+        await this.pullRemoteFile(file.path, current.json.sha, true);
+        return;
+      }
+
+      new Notice(`Сохранена более полная версия: ${file.name}`, 1600);
     }
 
     const payload = {
@@ -533,7 +588,18 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
       } else if (knownSha && item.sha === knownSha && localSha !== knownSha) {
         this.onLocalChange(local);
       } else if (knownSha && item.sha !== knownSha && localSha !== knownSha) {
-        await this.pullRemoteFile(item.path, item.sha, true);
+        const remoteBytes = item.sha === "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+          ? new Uint8Array(0)
+          : await this.fetchBlob(item.sha);
+        const resolution = await this.resolveLinearTextConflict(item.path, localBytes, remoteBytes, knownSha);
+
+        if (resolution === "local") {
+          await this.pushFileSafely(local);
+        } else if (resolution === "remote") {
+          await this.pullRemoteFile(item.path, item.sha, false);
+        } else {
+          await this.pullRemoteFile(item.path, item.sha, true);
+        }
         received++;
       } else if (!knownSha && item.sha === "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391" && localBytes.length) {
         // The empty note may have reached GitHub while the user was typing.
