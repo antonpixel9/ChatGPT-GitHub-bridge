@@ -46,6 +46,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     this.addCommand({ id: "push-current-note", name: "Отправить открытую заметку и фотографии", callback: () => this.pushCurrentNote() });
     this.addCommand({ id: "pull-current-note", name: "Получить открытую заметку из GitHub", callback: () => this.pullCurrentNote() });
     this.addCommand({ id: "update-plugin", name: "Проверить обновление плагина", callback: () => this.checkForPluginUpdate(true) });
+    this.addCommand({id:"install-keep-photo-gallery",name:"Установить или обновить Keep Photo Gallery",callback:()=>this.checkForPhotoGallery(true)});
     this.addCommand({ id: "install-keep-notes", name: "Установить или обновить Keep Notes", callback: () => this.checkForCompanionPlugin(true) });
 
     this.addRibbonIcon("refresh-cw", "Синхронизировать сейчас", () => this.backgroundSync(true));
@@ -774,6 +775,65 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
   }
 
 
+  async checkForPhotoGallery(showNotice, ref) {
+    if ((!this.settings.autoUpdate && !showNotice) || !this.requireSettings(showNotice) || this.photoGalleryInstalling) return;
+    this.photoGalleryInstalling = true;
+    const adapter = this.app.vault.adapter;
+    const dir = `${this.app.vault.configDir || '.obsidian'}/plugins/keep-photo-gallery`;
+    const backup = new Map();
+    let writing = false;
+    try {
+      const pinnedRef = ref || await this.getRemoteHead();
+      if (!pinnedRef) throw new Error('Не удалось получить версию GitHub');
+      const remote = await this.getRemoteFile('.obsidian/plugins/keep-photo-gallery/manifest.json', pinnedRef);
+      if (remote.status === 404) return;
+      if (remote.status !== 200 || !remote.json.content) throw new Error('manifest.json');
+      const manifestText = this.base64ToText(remote.json.content);
+      const manifest = JSON.parse(manifestText);
+      if (manifest.id !== 'keep-photo-gallery' || !/^\d+\.\d+\.\d+$/.test(manifest.version) || manifest.isDesktopOnly !== false) throw new Error('Некорректный манифест Keep Photo Gallery');
+      let localManifest = null;
+      if (await adapter.exists(`${dir}/manifest.json`)) {
+        try { localManifest = JSON.parse(await adapter.read(`${dir}/manifest.json`)); } catch (_) {}
+      }
+      const complete = await adapter.exists(`${dir}/main.js`) && await adapter.exists(`${dir}/styles.css`);
+      if (localManifest && localManifest.version === manifest.version && complete) {
+        if (showNotice) new Notice('Keep Photo Gallery уже установлен. Включите его в настройках сторонних плагинов.');
+        return;
+      }
+      const main = await this.getRemoteFile('.obsidian/plugins/keep-photo-gallery/main.js', pinnedRef);
+      const styles = await this.getRemoteFile('.obsidian/plugins/keep-photo-gallery/styles.css', pinnedRef);
+      if (main.status !== 200 || !main.json.content || styles.status !== 200 || !styles.json.content) throw new Error('Не все файлы Keep Photo Gallery доступны');
+      const mainText = this.base64ToText(main.json.content), cssText = this.base64ToText(styles.json.content);
+      if (!mainText.includes('class KeepPhotoGallery') || !cssText.includes('.kpg-grid')) throw new Error('Неполный пакет Keep Photo Gallery');
+      for (const name of ['main.js','styles.css','manifest.json']) {
+        const path = `${dir}/${name}`;
+        if (await adapter.exists(path)) backup.set(name, await adapter.read(path));
+      }
+      for (const path of [this.app.vault.configDir || '.obsidian', `${this.app.vault.configDir || '.obsidian'}/plugins`, dir]) {
+        if (!(await adapter.exists(path))) await adapter.mkdir(path);
+      }
+      writing = true;
+      await adapter.write(`${dir}/main.js`, mainText);
+      await adapter.write(`${dir}/styles.css`, cssText);
+      // Manifest is written last. An incomplete transfer cannot announce a new version.
+      await adapter.write(`${dir}/manifest.json`, manifestText);
+      new Notice(localManifest ? `Keep Photo Gallery обновлён до ${manifest.version}. Перезапустите Obsidian.` : 'Keep Photo Gallery установлен. Перезапустите Obsidian и включите Keep Photo Gallery в сторонних плагинах.', 12000);
+    } catch (error) {
+      if (writing) {
+        for (const name of ['main.js','styles.css','manifest.json']) {
+          try {
+            if (backup.has(name)) await adapter.write(`${dir}/${name}`,backup.get(name));
+            else if (await adapter.exists(`${dir}/${name}`)) await adapter.remove(`${dir}/${name}`);
+          } catch (rollbackError) { console.error('Keep Photo Gallery installation rollback:', rollbackError); }
+        }
+      }
+      console.error('Keep Photo Gallery installation:',error);
+      this.photoGalleryChecked = false;
+      new Notice('Не удалось установить Keep Photo Gallery. Плагин повторит попытку при следующей синхронизации.',8000);
+    } finally { this.photoGalleryInstalling = false; }
+  }
+
+
   async githubJson(path, method, body) {
     return requestUrl({
       url: this.apiUrl(path),
@@ -1033,7 +1093,10 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     // Plugin updates are independent from note synchronization. This must run
     // even when automatic sync is disabled or the first safe download has not
     // completed yet.
-    if (this.settings.autoUpdate) await this.checkForPluginUpdate(false);
+    if (this.settings.autoUpdate) {
+      await this.checkForPluginUpdate(false);
+      if (!this.photoGalleryChecked) {this.photoGalleryChecked=true;await this.checkForPhotoGallery(false);}
+    }
 
     if (!this.settings.autoSync && !showNotice) return;
     if (!this.settings.initialUploadComplete) {
@@ -1129,3 +1192,4 @@ class BridgeSettingTab extends PluginSettingTab {
     );
   }
 }
+
