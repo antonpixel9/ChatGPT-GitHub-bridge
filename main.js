@@ -46,8 +46,9 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     this.addCommand({ id: "push-current-note", name: "Отправить открытую заметку и фотографии", callback: () => this.pushCurrentNote() });
     this.addCommand({ id: "pull-current-note", name: "Получить открытую заметку из GitHub", callback: () => this.pullCurrentNote() });
     this.addCommand({ id: "update-plugin", name: "Проверить обновление плагина", callback: () => this.checkForPluginUpdate(true) });
-    this.addCommand({id:"install-keep-photo-gallery",name:"Установить или обновить Keep Photo Gallery",callback:()=>this.checkForPhotoGallery(true)});
     this.addCommand({ id: "install-keep-notes", name: "Установить или обновить Keep Notes", callback: () => this.checkForCompanionPlugin(true) });
+
+    this.addCommand({ id: "install-keep-photo-gallery", name: "Установить или обновить Keep Photo Gallery", callback: () => this.checkForPhotoGallery(true) });
 
     this.addRibbonIcon("refresh-cw", "Синхронизировать сейчас", () => this.backgroundSync(true));
 
@@ -774,7 +775,6 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     } finally { this.companionInstalling = false; }
   }
 
-
   async checkForPhotoGallery(showNotice, ref) {
     if ((!this.settings.autoUpdate && !showNotice) || !this.requireSettings(showNotice) || this.photoGalleryInstalling) return;
     this.photoGalleryInstalling = true;
@@ -804,7 +804,7 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
       const styles = await this.getRemoteFile('.obsidian/plugins/keep-photo-gallery/styles.css', pinnedRef);
       if (main.status !== 200 || !main.json.content || styles.status !== 200 || !styles.json.content) throw new Error('Не все файлы Keep Photo Gallery доступны');
       const mainText = this.base64ToText(main.json.content), cssText = this.base64ToText(styles.json.content);
-      if (!mainText.includes('class KeepPhotoGallery') || !cssText.includes('.kpg-grid')) throw new Error('Неполный пакет Keep Photo Gallery');
+      if (!mainText.includes('class KeepPhotoGallery') || !cssText.includes('.kpg-gallery')) throw new Error('Неполный пакет Keep Photo Gallery');
       for (const name of ['main.js','styles.css','manifest.json']) {
         const path = `${dir}/${name}`;
         if (await adapter.exists(path)) backup.set(name, await adapter.read(path));
@@ -1095,7 +1095,10 @@ module.exports = class ChatGPTGitHubBridge extends Plugin {
     // completed yet.
     if (this.settings.autoUpdate) {
       await this.checkForPluginUpdate(false);
-      if (!this.photoGalleryChecked) {this.photoGalleryChecked=true;await this.checkForPhotoGallery(false);}
+      if (!this.photoGalleryChecked) {
+        this.photoGalleryChecked = true;
+        await this.checkForPhotoGallery(false);
+      }
     }
 
     if (!this.settings.autoSync && !showNotice) return;
